@@ -1,0 +1,17 @@
+# Core numerics
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+
+# Plotting / evaluation
+matplotlib>=3.7
+
+# Parquet output (recommended)
+pyarrow>=12
+
+# Physics engine
+emepy
+simphony
+
+# ML
+torch>=2.0
