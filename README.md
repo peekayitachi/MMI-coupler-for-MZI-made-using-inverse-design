@@ -1,5 +1,4 @@
-# MMI→MZI Inverse Design Project (dataset + comparative inverse ML)
-
+# MMI for a MZI using Inverse Design 
 This project generates a **dataset** for a **2×2 MMI coupler** (used inside an **MZI**) and supports **comparative analysis of inverse-design ML models** trained on that dataset.
 
 It includes:
@@ -380,3 +379,4 @@ If you want, tell me:
 - what “acceptable loss” means for you (e.g., IL < 1 dB)
 
 …and I’ll tune the ranges/QC defaults so the dataset is both **high quality** and **not biased**.
+
