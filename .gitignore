@@ -1,0 +1,61 @@
+# Python environment
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# PyTorch models and data (large binary files)
+runs/
+*.pt
+*.pth
+checkpoints/
+
+# Data files
+*.parquet
+*.csv.gz
+*.csv
+data/
+*.npy
+*.npz
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.iml
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+
+# OS
+Thumbs.db
+.DS_Store
+.env
+.env.local
+
+# Reports (keep only metrics, ignore large comparison outputs)
+reports/*
+!reports/*.txt
+!reports/*metrics*

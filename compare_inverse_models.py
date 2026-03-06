@@ -33,6 +33,14 @@ import torch
 
 import mmi_mzi_project as proj
 
+# Ensure torch is available (required for this comparison script)
+if not proj.TORCH_AVAILABLE:
+    raise RuntimeError(
+        "PyTorch is required for compare_inverse_models.py.\n"
+        "Install it with: pip install torch\n\n"
+        f"Original import error: {proj.TORCH_IMPORT_ERROR}"
+    )
+
 
 def load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -52,7 +60,7 @@ def load_forward_model(run_dir: Path) -> Tuple[torch.nn.Module, Dict[str, Any], 
 
     in_dim = len(x_scaler["mean"])
     out_dim = len(y_scaler["mean"])
-    model = proj.MLP(in_dim=in_dim, out_dim=out_dim, hidden=(256, 256, 256), dropout=0.0)
+    model = proj.MLP(in_dim=in_dim, out_dim=out_dim, hidden=(256, 256, 256), dropout=0.05)
     state = torch.load(ckpt_path, map_location="cpu")
     model.load_state_dict(state["model"])
     model.eval()
@@ -267,18 +275,33 @@ def main() -> None:
         description="Compare MDN vs cGAN inverse models using the forward surrogate.",
     )
     ap.add_argument("--run-dir", required=True, help="Run directory (with data/ and checkpoints/ from mmi_mzi_project.py)")
-    ap.add_argument("--mdn-csv", required=True, help="MDN candidates CSV (inverse_candidates.csv)")
-    ap.add_argument("--cgan-csv", required=True, help="cGAN candidates CSV (cgan_candidates.csv)")
+    ap.add_argument(
+        "--mdn-csv",
+        default=None,
+        help="MDN candidates CSV (default: <run-dir>/reports/inverse_candidates.csv)",
+    )
+    ap.add_argument(
+        "--cgan-csv",
+        default=None,
+        help="cGAN candidates CSV (default: <run-dir>/reports/cgan_candidates.csv)",
+    )
     ap.add_argument("--target-er", type=float, required=True, help="Target ER (dB)")
     ap.add_argument("--target-bw", type=float, required=True, help="Target BW (nm)")
     ap.add_argument("--target-il", type=float, required=True, help="Target mean IL (dB)")
     ap.add_argument("--max-samples", type=int, default=None, help="Optional: cap number of samples from each CSV")
 
     args = ap.parse_args()
+    
+    run_dir = Path(args.run_dir)
+    
+    # Use defaults if not specified
+    mdn_csv = Path(args.mdn_csv) if args.mdn_csv else run_dir / "reports" / "inverse_candidates.csv"
+    cgan_csv = Path(args.cgan_csv) if args.cgan_csv else run_dir / "reports" / "cgan_candidates.csv"
+    
     cfg = CompareConfig(
-        run_dir=Path(args.run_dir),
-        mdn_csv=Path(args.mdn_csv),
-        cgan_csv=Path(args.cgan_csv),
+        run_dir=run_dir,
+        mdn_csv=mdn_csv,
+        cgan_csv=cgan_csv,
         target_er=args.target_er,
         target_bw=args.target_bw,
         target_il=args.target_il,

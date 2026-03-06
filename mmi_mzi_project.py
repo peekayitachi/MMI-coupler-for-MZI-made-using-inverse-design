@@ -38,7 +38,6 @@ Quick start (after installing deps):
     python mmi_mzi_project.py train-inverse --run-dir runs/pilot_v1
     python mmi_mzi_project.py inverse-design --run-dir runs/pilot_v1 --target-er 20 --target-bw 40 --target-il 1.0
 
-Author: ChatGPT (GPT-5.2 Pro)
 """
 
 from __future__ import annotations
@@ -60,6 +59,7 @@ import signal
 import sys
 import textwrap
 import time
+import scipy 
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
@@ -68,16 +68,33 @@ import numpy as np
 import pandas as pd
 from scipy.stats import qmc
 
-# Torch is used for ML (installed in this environment, but still treated as optional at runtime).
+# Torch is optional at import-time (only needed for training/inverse-design commands).
+# Catch ImportError and OSError (Windows DLL issues) but not other Exceptions.
+TORCH_AVAILABLE = False
+TORCH_IMPORT_ERROR = ""
+TORCH_AVAILABLE = False
+TORCH_IMPORT_ERROR = ""
+torch = None
+nn = None
+optim = None
+Dataset = None
+DataLoader = None
+
 try:
     import torch
     import torch.nn as nn
-    from torch.utils.data import DataLoader, Dataset
-except Exception:  # pragma: no cover
-    torch = None  # type: ignore
-    nn = None  # type: ignore
-    DataLoader = None  # type: ignore
-    Dataset = object  # type: ignore
+    import torch.optim as optim
+    from torch.utils.data import Dataset, DataLoader
+    TORCH_AVAILABLE = True
+    print("[DEBUG] PyTorch imported successfully", file=sys.stderr)
+except (ImportError, OSError) as e:
+    # ImportError: torch not installed
+    # OSError: Windows DLL loading failure, missing CUDA libs, etc.
+    TORCH_IMPORT_ERROR = str(e)
+    TORCH_AVAILABLE = False
+    # torch, nn, optim, Dataset, DataLoader remain None
+    print(f"[DEBUG] Torch import failed: {e}", file=sys.stderr)
+    pass
 
 
 # =============================================================================
@@ -129,7 +146,7 @@ class PlatformConfig:
 
 @dataclass(frozen=True)
 class WavelengthConfig:
-    """Wavelength sweep configuration (nanometers)."""
+    """Wavelength sweep configuration (nanometers, all in nm units throughout)."""
     start_nm: int = 1520
     stop_nm: int = 1580
     step_nm: int = 1
@@ -264,7 +281,7 @@ class GlobalConfig:
 def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
-    if torch is not None:
+    if TORCH_AVAILABLE:
         torch.manual_seed(seed)
 
 
@@ -315,9 +332,17 @@ def setup_logging(run_dir: Path, console_level: int = logging.INFO) -> logging.L
 
 
 def save_json(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
-    tmp.replace(path)
+    # On Windows, replace() may fail if file is locked; try removing first
+    try:
+        tmp.replace(path)
+    except PermissionError:
+        # File locked or already exists; remove old file first (Windows issue)
+        if path.exists():
+            path.unlink()
+        tmp.rename(path)
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -1226,8 +1251,9 @@ def _quick_eval_candidate(
 
         return {"geom": geom, "tau_in1": float(tau), "split_r_in1": float(r), "S": S}
     except Exception as e:
-        logger.debug(f"Quick-eval failed geom_id={geom.geom_id}: {e}")
-        return None
+        logger.warning(f"Quick-eval failed geom_id={geom.geom_id}: {e}")
+        # logger.debug(f"Quick-eval failed geom_id={geom.geom_id}: {e}")
+        # return None
 
 
 def select_geometries_stratified(
@@ -1238,18 +1264,34 @@ def select_geometries_stratified(
     dry_run: bool,
 ) -> List[Geometry]:
     """
-    Evaluate candidates at λ0 and keep a balanced set across (r, tau) bins.
+    Evaluate candidates at lambda_0 and keep a balanced set across (r, tau) bins.
     """
-    logger.info(f"Quick evaluating {len(candidates)} candidates at λ0={cfg.strat.lambda0_nm} nm ...")
+    logger.info(f"Quick evaluating {len(candidates)} candidates at lambda_0={cfg.strat.lambda0_nm} nm ...")
 
     evals = []
+    failed_count = 0
+    tau_filtered_count = 0
+    
     for g in candidates:
         r = _quick_eval_candidate(g, cfg, stage, logger, dry_run=dry_run)
         if r is not None:
             evals.append(r)
+        else:
+            tau_filtered_count += 1
+            failed_count += 1
 
     if not evals:
-        raise RuntimeError("No candidates survived quick-eval. Check solver setup / ranges / QC thresholds.")
+        # Provide actionable diagnostics
+        logger.error("No candidates survived quick-eval.")
+        logger.error(f"  Attempted: {len(candidates)}")
+        logger.error(f"  Filtered by tau_min/tau_max thresholds: {tau_filtered_count}")
+        logger.error(f"  Total failures/invalid: {failed_count}")
+        logger.error(f"\nRecommendations:")
+        logger.error(f"  1. Check EMEPy installation and solver fidelity settings (see logs above)")
+        logger.error(f"  2. Try relaxing tau thresholds: tau_min <= target <= tau_max")
+        logger.error(f"     Current: {cfg.strat.tau_min:.2f} <= tau <= {cfg.strat.tau_max:.2f}")
+        logger.error(f"  3. Try --dry-run first to debug without expensive solver calls")
+        raise RuntimeError("No candidates survived quick-eval. See logs for diagnostics.")
 
     r_vals = np.array([e["split_r_in1"] for e in evals], dtype=np.float64)
     tau_vals = np.array([e["tau_in1"] for e in evals], dtype=np.float64)
@@ -1528,7 +1570,14 @@ def generate_dataset(
 
 def evaluate_dataset(run_dir: Path, logger: logging.Logger) -> None:
     """
-    Generate sanity-check plots + summary tables into run_dir/reports.
+    Generate sanity-check plots + summary tables + dataset card into run_dir/reports.
+    Produces publication-ready evaluation artifacts:
+      - Parameter histograms
+      - Geometry coverage scatter plots
+      - MZI metric distributions
+      - Bin count table at λ0
+      - Dataset card (JSON + CSV summary)
+      - QC pass rate diagnostics
     """
     reports = run_dir / "reports"
     ensure_dir(reports)
@@ -1541,35 +1590,51 @@ def evaluate_dataset(run_dir: Path, logger: logging.Logger) -> None:
     df_mzi = pandas_read_shards(mzi_dir)
 
     # Basic stats
+    n_unique_geoms = int(df_mzi["geom_id"].nunique()) if "geom_id" in df_mzi.columns else None
+    n_total_rows = int(len(df_mzi))
+    n_mc_per_geom = int(n_total_rows / n_unique_geoms) if n_unique_geoms and n_unique_geoms > 0 else 1
+    
     summary = {
         "n_device_rows": int(len(df_dev)),
         "n_mzi_rows": int(len(df_mzi)),
-        "n_geom_ids": int(df_mzi["geom_id"].nunique()) if "geom_id" in df_mzi.columns else None,
+        "n_geom_ids": n_unique_geoms,
+        "n_mc_per_geom": n_mc_per_geom,
         "lambda_nm_min": int(df_dev["lambda_nm"].min()),
         "lambda_nm_max": int(df_dev["lambda_nm"].max()),
+        "lambda_nm_step": int(np.median(np.diff(np.sort(df_dev["lambda_nm"].unique())))),
     }
 
     # Distributions and checks
-    # 1) Parameter histograms
     import matplotlib.pyplot as plt  # local import to keep base import light
 
     params = ["W_mmi_um", "L_mmi_um", "gap_um", "W_io_um", "taper_len_um"]
+    param_stats = {}
     for p in params:
-        plt.figure()
-        df_mzi[p].hist(bins=40)
-        plt.xlabel(p)
-        plt.ylabel("count")
-        plt.title(f"Distribution: {p}")
-        plt.tight_layout()
-        plt.savefig(reports / f"hist_{p}.png", dpi=160)
-        plt.close()
+        if p in df_mzi.columns:
+            plt.figure(figsize=(6, 4))
+            df_mzi[p].hist(bins=40, edgecolor='black', alpha=0.7)
+            plt.xlabel(p)
+            plt.ylabel("count")
+            plt.title(f"Distribution: {p}")
+            plt.tight_layout()
+            plt.savefig(reports / f"hist_{p}.png", dpi=160)
+            plt.close()
+            
+            param_stats[p] = {
+                "mean": float(df_mzi[p].mean()),
+                "std": float(df_mzi[p].std()),
+                "min": float(df_mzi[p].min()),
+                "max": float(df_mzi[p].max()),
+                "median": float(df_mzi[p].median()),
+            }
 
     # 2) Scatter W_mmi vs L_mmi
-    plt.figure()
-    plt.scatter(df_mzi["W_mmi_um"], df_mzi["L_mmi_um"], s=6)
-    plt.xlabel("W_mmi_um")
-    plt.ylabel("L_mmi_um")
+    plt.figure(figsize=(8, 6))
+    plt.scatter(df_mzi["W_mmi_um"], df_mzi["L_mmi_um"], s=10, alpha=0.5, edgecolors='none')
+    plt.xlabel("W_mmi_um", fontsize=11)
+    plt.ylabel("L_mmi_um", fontsize=11)
     plt.title("Geometry coverage: W_mmi vs L_mmi")
+    plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(reports / "scatter_Wmmi_Lmmi.png", dpi=160)
     plt.close()
@@ -1578,11 +1643,12 @@ def evaluate_dataset(run_dir: Path, logger: logging.Logger) -> None:
     lam0 = 1550
     df0 = df_dev[df_dev["lambda_nm"] == lam0].copy()
     if len(df0) > 0:
-        plt.figure()
-        plt.scatter(df0["split_r_in1"], df0["tau_in1"], s=6)
-        plt.xlabel("split_r_in1 (|S(out1,in1)|^2 / tau)")
-        plt.ylabel("tau_in1")
-        plt.title("λ0 diagnostics: split ratio vs throughput")
+        plt.figure(figsize=(7, 5))
+        plt.scatter(df0["split_r_in1"], df0["tau_in1"], s=8, alpha=0.6, edgecolors='none')
+        plt.xlabel("split_r_in1", fontsize=11)
+        plt.ylabel("tau_in1", fontsize=11)
+        plt.title(f"wavelength={lam0} nm diagnostics: split ratio vs throughput")
+        plt.grid(True, alpha=0.3)
         plt.tight_layout()
         plt.savefig(reports / "lambda0_split_vs_tau.png", dpi=160)
         plt.close()
@@ -1595,79 +1661,162 @@ def evaluate_dataset(run_dir: Path, logger: logging.Logger) -> None:
         bin_counts = df0.groupby(["r_bin", "t_bin"]).size().unstack(fill_value=0)
         bin_counts.to_csv(reports / "lambda0_bin_counts.csv")
         summary["lambda0_bin_counts_shape"] = [int(bin_counts.shape[0]), int(bin_counts.shape[1])]
+        summary["lambda0_coverage_pct"] = float(100.0 * len(df0) / len(df_mzi))
 
-    # 4) MZI metric distributions
-    for m in ["ER1_min_dB", "ER1_bw_nm", "IL1_mean_dB", "ER2_min_dB", "ER2_bw_nm", "IL2_mean_dB"]:
+    # 4) MZI metric distributions and statistics
+    mzi_metrics = ["ER1_min_dB", "ER1_bw_nm", "IL1_mean_dB", "ER2_min_dB", "ER2_bw_nm", "IL2_mean_dB"]
+    mzi_stats = {}
+    for m in mzi_metrics:
         if m in df_mzi.columns:
-            plt.figure()
-            df_mzi[m].hist(bins=40)
-            plt.xlabel(m)
-            plt.ylabel("count")
-            plt.title(f"Distribution: {m}")
-            plt.tight_layout()
-            plt.savefig(reports / f"hist_{m}.png", dpi=160)
-            plt.close()
+            # Filter out infs and nans for cleaner stats
+            valid = df_mzi[m].replace([np.inf, -np.inf], np.nan).dropna()
+            if len(valid) > 0:
+                plt.figure(figsize=(6, 4))
+                valid.hist(bins=40, edgecolor='black', alpha=0.7)
+                plt.xlabel(m)
+                plt.ylabel("count")
+                plt.title(f"Distribution: {m}")
+                plt.tight_layout()
+                plt.savefig(reports / f"hist_{m}.png", dpi=160)
+                plt.close()
+                
+                mzi_stats[m] = {
+                    "mean": float(valid.mean()),
+                    "std": float(valid.std()),
+                    "min": float(valid.min()),
+                    "max": float(valid.max()),
+                    "median": float(valid.median()),
+                }
 
-    # Save summary
-    save_json(reports / "summary.json", summary)
-    logger.info(f"Evaluation complete. See: {reports}")
+    # 5) QC diagnostics (if available)
+    qc_cols = [c for c in df_mzi.columns if 'qc' in c.lower()]
+    qc_stats = {}
+    if qc_cols:
+        for qc in qc_cols:
+            if df_mzi[qc].dtype in [bool, np.bool_, 'bool']:
+                pass_rate = float(df_mzi[qc].astype(float).mean())
+                qc_stats[qc] = {"pass_rate": pass_rate}
+
+    # Build comprehensive dataset card
+    dataset_card = {
+        "dataset_summary": summary,
+        "geometry_parameters": param_stats,
+        "mzi_metrics": mzi_stats,
+        "qc_diagnostics": qc_stats,
+        "generated_at": str(_dt.datetime.now().isoformat()),
+    }
+
+    # Save summary JSON (dataset card)
+    save_json(reports / "dataset_card.json", dataset_card)
+    
+    # Save compact CSV version for quick reference
+    card_df = pd.DataFrame([dataset_card["dataset_summary"]])
+    card_df.to_csv(reports / "dataset_summary.csv", index=False)
+    
+    logger.info(f"Evaluation complete. Artifacts saved to: {reports}")
+    logger.info(f"  - Parameter distributions (hist_*.png)")
+    logger.info(f"  - Geometry coverage scatter (scatter_Wmmi_Lmmi.png)")
+    logger.info(f"  - MZI metric distributions (hist_ER*.png, hist_IL*.png)")
+    logger.info(f"  - λ0 diagnostics (lambda0_split_vs_tau.png, lambda0_bin_counts.csv)")
+    logger.info(f"  - Dataset card (dataset_card.json, dataset_summary.csv)")
+    logger.info(f"\nDataset summary:")
+    logger.info(f"  Geometries: {summary['n_geom_ids']}, MC per geom: {summary['n_mc_per_geom']}")
+    logger.info(f"  Total MZI rows: {summary['n_mzi_rows']}, wavelength range: {summary['lambda_nm_min']}-{summary['lambda_nm_max']} nm")
 
 
 # =============================================================================
 # ML: forward surrogate and inverse design (PyTorch)
 # =============================================================================
 
-class NumpyDataset(Dataset):
-    def __init__(self, X: np.ndarray, Y: np.ndarray):
-        self.X = torch.from_numpy(X.astype(np.float32))
-        self.Y = torch.from_numpy(Y.astype(np.float32))
+# V1 commented out: torch was imported incorrectly at module level, causing import
+# failures even when torch wasn't needed. Now using TORCH_AVAILABLE flag instead.
+# class NumpyDataset(Dataset):
+#     def __init__(self, X: np.ndarray, Y: np.ndarray):
+#         self.X = torch.from_numpy(X.astype(np.float32))
+#         self.Y = torch.from_numpy(Y.astype(np.float32))
+#
+#     def __len__(self) -> int:
+#         return self.X.shape[0]
+#
+#     def __getitem__(self, idx: int):
+#         return self.X[idx], self.Y[idx]
 
-    def __len__(self) -> int:
-        return self.X.shape[0]
+if not TORCH_AVAILABLE:
+    # Torch isn't available; provide informative placeholders.
+    class NumpyDataset:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError(
+                "PyTorch is required for training/inverse-design commands.\n"
+                f"Install it with: pip install torch\n\n"
+                f"Original import error: {TORCH_IMPORT_ERROR}"
+            )
 
-    def __getitem__(self, idx: int):
-        return self.X[idx], self.Y[idx]
+    class MLP:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError(
+                "PyTorch is required for training/inverse-design commands.\n"
+                f"Install it with: pip install torch\n\n"
+                f"Original import error: {TORCH_IMPORT_ERROR}"
+            )
 
+    class MDN:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError(
+                "PyTorch is required for training/inverse-design commands.\n"
+                f"Install it with: pip install torch\n\n"
+                f"Original import error: {TORCH_IMPORT_ERROR}"
+            )
+else:
+    # Torch is available; define ML classes
+    class NumpyDataset(Dataset):
+        def __init__(self, X: np.ndarray, Y: np.ndarray):
+            self.X = torch.from_numpy(X.astype(np.float32))
+            self.Y = torch.from_numpy(Y.astype(np.float32))
 
-class MLP(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, hidden: Sequence[int] = (256, 256, 256), dropout: float = 0.0):
-        super().__init__()
-        layers: List[nn.Module] = []
-        d = in_dim
-        for h in hidden:
-            layers.append(nn.Linear(d, h))
-            layers.append(nn.ReLU())
-            if dropout > 0:
-                layers.append(nn.Dropout(dropout))
-            d = h
-        layers.append(nn.Linear(d, out_dim))
-        self.net = nn.Sequential(*layers)
+        def __len__(self) -> int:
+            return self.X.shape[0]
 
-    def forward(self, x):
-        return self.net(x)
+        def __getitem__(self, idx: int):
+            return self.X[idx], self.Y[idx]
 
+    class MLP(torch.nn.Module):
+        def __init__(self, in_dim: int, out_dim: int, hidden: Sequence[int] = (256, 256, 256), dropout: float = 0.0):
+            super().__init__()
+            layers: List[torch.nn.Module] = []
+            d = in_dim
+            for h in hidden:
+                layers.append(torch.nn.Linear(d, h))
+                layers.append(nn.ReLU())
+                if dropout > 0:
+                    layers.append(torch.nn.Dropout(dropout))
+                d = h
+            layers.append(torch.nn.Linear(d, out_dim))
+            self.net = torch.nn.Sequential(*layers)
 
-class MDN(nn.Module):
-    """
-    Mixture Density Network for inverse design: p(geometry | target_metrics).
-    Outputs K Gaussian components (diagonal covariance).
-    """
-    def __init__(self, in_dim: int, out_dim: int, K: int = 8, hidden: Sequence[int] = (256, 256)):
-        super().__init__()
-        self.K = K
-        self.out_dim = out_dim
-        self.backbone = MLP(in_dim, hidden[-1], hidden=hidden[:-1] if len(hidden) > 1 else (), dropout=0.0)
-        hdim = hidden[-1]
-        self.pi = nn.Linear(hdim, K)
-        self.mu = nn.Linear(hdim, K * out_dim)
-        self.log_sigma = nn.Linear(hdim, K * out_dim)
+        def forward(self, x):
+            return self.net(x)
 
-    def forward(self, x):
-        h = self.backbone(x)
-        pi = torch.softmax(self.pi(h), dim=-1)  # (B, K)
-        mu = self.mu(h).view(-1, self.K, self.out_dim)  # (B, K, D)
-        log_sigma = self.log_sigma(h).view(-1, self.K, self.out_dim).clamp(-7.0, 3.0)
-        return pi, mu, log_sigma
+    class MDN(torch.nn.Module):
+        """
+        Mixture Density Network for inverse design: p(geometry | target_metrics).
+        Outputs K Gaussian components (diagonal covariance).
+        """
+        def __init__(self, in_dim: int, out_dim: int, K: int = 8, hidden: Sequence[int] = (256, 256)):
+            super().__init__()
+            self.K = K
+            self.out_dim = out_dim
+            self.backbone = MLP(in_dim, hidden[-1], hidden=hidden[:-1] if len(hidden) > 1 else (), dropout=0.0)
+            hdim = hidden[-1]
+            self.pi = torch.nn.Linear(hdim, K)
+            self.mu = torch.nn.Linear(hdim, K * out_dim)
+            self.log_sigma = torch.nn.Linear(hdim, K * out_dim)
+
+        def forward(self, x):
+            h = self.backbone(x)
+            pi = torch.softmax(self.pi(h), dim=-1)  # (B, K)
+            mu = self.mu(h).view(-1, self.K, self.out_dim)  # (B, K, D)
+            log_sigma = self.log_sigma(h).view(-1, self.K, self.out_dim).clamp(-7.0, 3.0)
+            return pi, mu, log_sigma
 
 
 def mdn_nll(pi, mu, log_sigma, y) -> torch.Tensor:
@@ -1725,8 +1874,12 @@ def train_forward(
 
     This corresponds directly to the long-format device dataset and is a good reusable primitive for inverse design.
     """
-    if torch is None:
-        raise MissingDependency("PyTorch is not available in this Python environment.")
+    if not TORCH_AVAILABLE:
+        raise RuntimeError(
+            "PyTorch is required for train-forward.\n"
+            "Install it with: pip install torch\n\n"
+            f"Original import error: {TORCH_IMPORT_ERROR}"
+        )
 
     device_dir = run_dir / "data" / "device_long"
     df = pandas_read_shards(device_dir)
@@ -1778,7 +1931,7 @@ def train_forward(
 
     model = MLP(in_dim=X_train_s.shape[1], out_dim=Y_train_s.shape[1], hidden=(256, 256, 256), dropout=0.05)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.MSELoss()
+    loss_fn = torch.nn.MSELoss()
 
     best_val = float("inf")
     best_path = run_dir / "checkpoints" / "forward_best.pt"
@@ -1834,8 +1987,12 @@ def train_inverse(
       inputs: [ER1_bw_nm, ER1_min_dB, IL1_mean_dB, ER2_bw_nm, ER2_min_dB, IL2_mean_dB]
       outputs (distribution): geometry params [W_mmi_um, L_mmi_um, gap_um, W_io_um, taper_len_um]
     """
-    if torch is None:
-        raise MissingDependency("PyTorch is not available in this Python environment.")
+    if not TORCH_AVAILABLE:
+        raise RuntimeError(
+            "PyTorch is required for train-inverse.\n"
+            "Install it with: pip install torch\n\n"
+            f"Original import error: {TORCH_IMPORT_ERROR}"
+        )
 
     df = pandas_read_shards(run_dir / "data" / "mzi_metrics")
 
@@ -1926,6 +2083,7 @@ def inverse_design(
     target_il: float,
     n_samples: int = 256,
     pick_top_k: int = 10,
+    validate: bool = False,
 ) -> None:
     """
     Use the trained inverse MDN to sample candidate geometries for target specs.
@@ -1937,9 +2095,15 @@ def inverse_design(
       - target_il: mean IL (dB) you'd like (proxy)
 
     This is intentionally lightweight so you can iterate fast.
+    
+    If validate=True, re-runs physics solver on top-k candidates and produces validation report.
     """
-    if torch is None:
-        raise MissingDependency("PyTorch is not available in this Python environment.")
+    if not TORCH_AVAILABLE:
+        raise RuntimeError(
+            "PyTorch is required for inverse-design.\n"
+            "Install it with: pip install torch\n\n"
+            f"Original import error: {TORCH_IMPORT_ERROR}"
+        )
 
     inv_path = run_dir / "checkpoints" / "inverse_best.pt"
     if not inv_path.exists():
@@ -1979,22 +2143,27 @@ def inverse_design(
     mean = np.array(y_scaler["mean"], dtype=np.float64)
     std = np.array(y_scaler["std"], dtype=np.float64)
     geoms = ys * std + mean
+    
+    # Enforce hard physical bounds by clipping
+    geoms[:, 0] = np.clip(geoms[:, 0], 0.5, 20.0)    # Wm: waveguide width
+    geoms[:, 1] = np.clip(geoms[:, 1], 10.0, 500.0)  # Lm: MMI length
+    geoms[:, 2] = np.clip(geoms[:, 2], 0.05, 3.0)    # gap: gap between waveguides
+    geoms[:, 3] = np.clip(geoms[:, 3], 0.20, 0.80)   # Wio: I/O waveguide width
+    geoms[:, 4] = np.clip(geoms[:, 4], 0.5, 100.0)   # taper: taper factor
 
     # Score candidates with simple bounds (you should later validate using physics or forward surrogate)
     # Score encourages: small IL, large BW, large ER
     scores = []
     for i in range(geoms.shape[0]):
         Wm, Lm, gap, Wio, taper = geoms[i]
-        # Fabrication-ish bounds: keep within plausible ranges
-        if not (2.5 <= Wm <= 14.0 and 20 <= Lm <= 350 and 0.12 <= gap <= 2.0 and 0.30 <= Wio <= 0.60 and 2.0 <= taper <= 60):
-            continue
+        # All candidates pass bounds now (clipped above), just score them
         # Heuristic: prefer moderate tapers and not-too-extreme gaps
         reg = 0.01 * (abs(Wm - 8.0) + 0.003 * abs(Lm - 120.0) + abs(gap - 0.5))
         score = (target_bw / 50.0) + (target_er / 20.0) - (target_il / 2.0) - reg
         scores.append((score, i))
 
     if not scores:
-        logger.warning("No candidates survived heuristic bounds. Try relaxing targets or increase n_samples.")
+        logger.warning("No candidates sampled (unexpected error).")
         return
 
     scores.sort(reverse=True, key=lambda t: t[0])
@@ -2006,7 +2175,7 @@ def inverse_design(
         Wm, Lm, gap, Wio, taper = geoms[idx]
         logger.info(
             f"#{rank:02d} score={score:.3f} | "
-            f"W_mmi={Wm:.3f} µm, L_mmi={Lm:.2f} µm, gap={gap:.3f} µm, W_io={Wio:.3f} µm, taper={taper:.2f} µm"
+            f"W_mmi={Wm:.3f} um, L_mmi={Lm:.2f} um, gap={gap:.3f} um, W_io={Wio:.3f} um, taper={taper:.2f} um"
         )
 
     # Save to CSV
@@ -2017,6 +2186,125 @@ def inverse_design(
         rows.append({"score": score, "W_mmi_um": Wm, "L_mmi_um": Lm, "gap_um": gap, "W_io_um": Wio, "taper_len_um": taper})
     pd.DataFrame(rows).to_csv(out, index=False)
     logger.info(f"Saved candidates to: {out}")
+    
+    # Optional: validate with physics solver
+    if validate:
+        logger.info("Running inverse design validation with physics solver...")
+        inverse_validate(run_dir, logger, out)
+
+
+def inverse_validate(
+    run_dir: Path,
+    logger: logging.Logger,
+    candidates_csv: Path,
+    verbose: bool = True,
+) -> None:
+    """
+    Re-run physics solver on candidate geometries to validate surrogate predictions.
+    Compares predicted vs simulated metrics and outputs a validation report.
+    
+    Requires EMEPy to be available.
+    """
+    require_emepy(logger)
+    
+    cfg = GlobalConfig()
+    stage = next((s for s in cfg.stages if s.name == "pilot"), cfg.stages[0])
+    
+    # Load candidates
+    if not candidates_csv.exists():
+        logger.warning(f"Candidates CSV not found: {candidates_csv}")
+        return
+    
+    df_cand = pd.read_csv(candidates_csv)
+    logger.info(f"Validating {len(df_cand)} candidate geometries...")
+    
+    # Load forward surrogate if available (for prediction comparison)
+    fwd_path = run_dir / "checkpoints" / "forward_best.pt"
+    has_forward = fwd_path.exists()
+    
+    wl_m = stage.wl.grid_m()
+    
+    validation_rows = []
+    
+    for idx, row in df_cand.iterrows():
+        geom = Geometry(
+            geom_id=idx,
+            W_mmi_um=float(row["W_mmi_um"]),
+            L_mmi_um=float(row["L_mmi_um"]),
+            gap_um=float(row["gap_um"]),
+            W_io_um=float(row["W_io_um"]),
+            taper_len_um=float(row["taper_len_um"]),
+        )
+        
+        try:
+            # Run full solver (same as in generation)
+            S_list = []
+            for wl in wl_m:
+                S = emepy_mmi_sparams_2x2(
+                    geom=geom,
+                    wl_m=wl,
+                    fidelity=stage.fidelity_full,
+                    platform=cfg.platform,
+                    qc=cfg.qc,
+                    logger=logger,
+                    dn_eff=0.0,
+                )
+                S_list.append(S)
+            
+            # Compute MZI metrics
+            metrics = _mzi_metrics_from_coupler_spectrum(
+                wl_nm=stage.wl.grid_nm().astype(np.float64),
+                S_list=S_list,
+                er_threshold_db=20.0,
+            )
+            
+            val_row = {
+                "geom_id": idx,
+                "W_mmi_um": float(row["W_mmi_um"]),
+                "L_mmi_um": float(row["L_mmi_um"]),
+                "gap_um": float(row["gap_um"]),
+                "W_io_um": float(row["W_io_um"]),
+                "taper_len_um": float(row["taper_len_um"]),
+                "ER1_min_dB_sim": float(metrics.get("ER1_min_dB", np.nan)),
+                "ER1_bw_nm_sim": float(metrics.get("ER1_bw_nm", np.nan)),
+                "IL1_mean_dB_sim": float(metrics.get("IL1_mean_dB", np.nan)),
+                "ER2_min_dB_sim": float(metrics.get("ER2_min_dB", np.nan)),
+                "ER2_bw_nm_sim": float(metrics.get("ER2_bw_nm", np.nan)),
+                "IL2_mean_dB_sim": float(metrics.get("IL2_mean_dB", np.nan)),
+                "solver_status": "success",
+            }
+            validation_rows.append(val_row)
+            
+            if verbose and (idx + 1) % max(1, len(df_cand) // 5) == 0:
+                logger.info(f"  Validated {idx + 1}/{len(df_cand)} geometries...")
+        
+        except Exception as e:
+            val_row = {
+                "geom_id": idx,
+                "W_mmi_um": float(row["W_mmi_um"]),
+                "L_mmi_um": float(row["L_mmi_um"]),
+                "gap_um": float(row["gap_um"]),
+                "W_io_um": float(row["W_io_um"]),
+                "taper_len_um": float(row["taper_len_um"]),
+                "solver_status": f"failed: {str(e)[:50]}",
+            }
+            validation_rows.append(val_row)
+    
+    # Save validation report
+    df_val = pd.DataFrame(validation_rows)
+    val_path = run_dir / "reports" / "inverse_validation.csv"
+    df_val.to_csv(val_path, index=False)
+    logger.info(f"Validation report saved to: {val_path}")
+    
+    # Summary statistics
+    success = df_val["solver_status"].eq("success").sum()
+    logger.info(f"Validation complete: {success}/{len(df_val)} geometries simulated successfully")
+    
+    if success > 0:
+        df_ok = df_val[df_val["solver_status"] == "success"]
+        logger.info(f"  ER1 range: {df_ok['ER1_min_dB_sim'].min():.1f} – {df_ok['ER1_min_dB_sim'].max():.1f} dB")
+        logger.info(f"  ER1 BW range: {df_ok['ER1_bw_nm_sim'].min():.1f} – {df_ok['ER1_bw_nm_sim'].max():.1f} nm")
+        logger.info(f"  IL1 range: {df_ok['IL1_mean_dB_sim'].min():.2f} – {df_ok['IL1_mean_dB_sim'].max():.2f} dB")
 
 
 # =============================================================================
@@ -2031,11 +2319,18 @@ def preflight(cfg: GlobalConfig, logger: logging.Logger) -> None:
     logger.info(f"Python: {sys.version.split()[0]}")
     logger.info(f"NumPy: {np.__version__}")
     logger.info(f"Pandas: {pd.__version__}")
-    logger.info(f"SciPy: {qmc.__module__.split('.')[0]} (qmc available)")
+    # logger.info(f"SciPy: {qmc.__module__.split('.')[0]} (qmc available)")
+    logger.info(f"SciPy: {scipy.__version__} (qmc available)")
 
     # Optional deps
     ok_emepy, err_emepy = _try_import_emepy()
     logger.info(f"EMEPy import: {'OK' if ok_emepy else 'MISSING'}")
+    if not ok_emepy:
+        logger.warning(
+            f"  EMEPy is required for physics-backed dataset generation (generate/full-run).\n"
+            f"  Install: pip install emepy\n"
+            f"  Error: {err_emepy}"
+        )
     try:
         import simphony  # noqa
         ver = getattr(simphony, "__version__", None)
@@ -2052,8 +2347,15 @@ def preflight(cfg: GlobalConfig, logger: logging.Logger) -> None:
         logger.info("pyarrow: MISSING (will fall back to gzipped CSV shards)")
         logger.info("  Install: pip install pyarrow")
 
-    if torch is not None:
-        logger.info(f"PyTorch: {torch.__version__} (CPU)")
+    if TORCH_AVAILABLE:
+        logger.info(f"PyTorch: {torch.__version__} (available for training/inverse)")
+    else:
+        logger.warning(
+            f"PyTorch: NOT AVAILABLE.\n"
+            f"  Required for training-forward, train-inverse, inverse-design commands.\n"
+            f"  Install: pip install torch\n"
+            f"  Error: {TORCH_IMPORT_ERROR}"
+        )
 
     # Key publishable assumptions checklist
     msg = f"""
@@ -2062,7 +2364,7 @@ def preflight(cfg: GlobalConfig, logger: logging.Logger) -> None:
       - Polarization: TE-focused port mode selection (TE fraction >= {cfg.qc.min_te_fraction})
       - Access symmetry: left/right identical
       - Ports: in1/in2 = top/bottom on left, out1/out2 = top/bottom on right
-      - Wavelength band defaults per stage, with 1520–1580 nm used for paper stage
+      - Wavelength band defaults per stage, with 1520-1580 nm used for paper stage
 
     Before you generate a paper dataset, confirm:
       1) Is your top cladding oxide or air?

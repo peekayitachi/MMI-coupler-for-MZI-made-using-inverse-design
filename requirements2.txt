@@ -1,0 +1,31 @@
+# ============================================================
+# MMI–MZI Inverse Design (Windows-safe, reproducible)
+# Pins all major deps to avoid:
+#   - NumPy 2.x (breaks numpy.testing.Tester in EMEPy)
+#   - Missing/conflicting JAX/Flax across orbax-checkpoint versions
+#   - uvloop on Windows (unsupported by orbax)
+# ============================================================
+
+# ---- Core numeric stack (PINNED for stability) ----
+numpy==1.26.4          # Must be <2.0 to keep numpy.testing.Tester for EMEPy
+scipy==1.11.4          # Stable with NumPy 1.26.x on CPython 3.11
+pandas==2.2.3          # Avoid 3.x alpha/churn
+matplotlib==3.8.4      # Compatible with NumPy 1.26
+
+# Data I/O
+pyarrow==15.0.2        # Pin to avoid ABI surprises
+
+# ---- Photonics / EME tooling ----
+emepy==1.2.2           # Pinned for reproducibility
+simphony==0.7.3        # Pulls sax/jax/flax stack; pinned
+
+# ---- JAX/Flax ecosystem (needed by simphony/sax) ----
+# Pin orbax-checkpoint to a Windows-safe version to avoid uvloop inclusion
+orbax-checkpoint==0.11.32
+
+# ---- ML (PyTorch; flexible but recommended) ----
+torch>=2.2,<3.0        # Allow CPU or CUDA; any recent 2.x
+
+# ---- API server (if used; exclude uvloop on Windows) ----
+uvicorn>=0.30,<1.0     # Standard version; no [standard] extra on Windows to avoid uvloop
+python-dotenv>=1.0,<2.0
