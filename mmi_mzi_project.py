@@ -2081,7 +2081,7 @@ def inverse_design(
     target_er: float,
     target_bw: float,
     target_il: float,
-    n_samples: int = 256,
+    n_samples: int = 1000,
     pick_top_k: int = 10,
     validate: bool = False,
 ) -> None:
@@ -2144,22 +2144,38 @@ def inverse_design(
     std = np.array(y_scaler["std"], dtype=np.float64)
     geoms = ys * std + mean
     
-    # Enforce hard physical bounds by clipping
-    geoms[:, 0] = np.clip(geoms[:, 0], 0.5, 20.0)    # Wm: waveguide width
-    geoms[:, 1] = np.clip(geoms[:, 1], 10.0, 500.0)  # Lm: MMI length
-    geoms[:, 2] = np.clip(geoms[:, 2], 0.05, 3.0)    # gap: gap between waveguides
-    geoms[:, 3] = np.clip(geoms[:, 3], 0.20, 0.80)   # Wio: I/O waveguide width
-    geoms[:, 4] = np.clip(geoms[:, 4], 0.5, 100.0)   # taper: taper factor
+    # Enforce hard physical bounds by clipping (match GlobalConfig.ranges exactly)
+    # Column order: [W_mmi_um, L_mmi_um, gap_um, W_io_um, taper_len_um]
+    geoms[:, 0] = np.clip(geoms[:, 0], 3.0, 12.0)    # W_mmi: µm
+    geoms[:, 1] = np.clip(geoms[:, 1], 30.0, 300.0)  # L_mmi: µm
+    geoms[:, 2] = np.clip(geoms[:, 2], 0.15, 1.50)   # gap: µm
+    geoms[:, 3] = np.clip(geoms[:, 3], 0.35, 0.55)   # W_io: µm
+    geoms[:, 4] = np.clip(geoms[:, 4], 5.0, 40.0)    # taper_len: µm
 
-    # Score candidates with simple bounds (you should later validate using physics or forward surrogate)
-    # Score encourages: small IL, large BW, large ER
+    # Score candidates with physics-informed heuristics
+    # Encourage: diverse geometries, balanced parameters, away from problematic bounds
     scores = []
+    
     for i in range(geoms.shape[0]):
         Wm, Lm, gap, Wio, taper = geoms[i]
-        # All candidates pass bounds now (clipped above), just score them
-        # Heuristic: prefer moderate tapers and not-too-extreme gaps
-        reg = 0.01 * (abs(Wm - 8.0) + 0.003 * abs(Lm - 120.0) + abs(gap - 0.5))
-        score = (target_bw / 50.0) + (target_er / 20.0) - (target_il / 2.0) - reg
+        
+        # Penalize being too close to bounds (encourage interior solutions)
+        bound_penalty = 0.0
+        bound_penalty += 0.1 * max(0, 1.0 - (Wm - 3.0))       # Close to lower W_mmi
+        bound_penalty += 0.1 * max(0, (Wm - 12.0))            # Close to upper W_mmi
+        bound_penalty += 0.05 * max(0, 1.0 - (Lm - 30.0))     # Close to lower L_mmi
+        bound_penalty += 0.05 * max(0, (Lm - 300.0))          # Close to upper L_mmi
+        
+        # Prefer moderate parameter values (not extreme)
+        center_bonus = 0.0
+        center_bonus += 0.05 * (1.0 - abs(Wm - 7.5) / 4.5)    # Prefer middle of W_mmi range
+        center_bonus += 0.03 * (1.0 - abs(Lm - 165.0) / 135.0) # Prefer middle of L_mmi range
+        center_bonus += 0.05 * (1.0 - abs(gap - 0.825) / 0.675) # Prefer middle of gap range
+        
+        # Base score from targets (all same, but kept for consistency)
+        base_score = (target_bw / 50.0) + (target_er / 20.0) - (target_il / 2.0)
+        
+        score = base_score - bound_penalty + center_bonus
         scores.append((score, i))
 
     if not scores:

@@ -381,6 +381,27 @@ def sample_cgan(
     std = np.array(geom_scaler["std"], dtype=np.float64)
     geom_samp = geom_samp_s * std + mean
 
+    # Soft clipping using tanh-like function to preserve diversity
+    # This allows slight overshoot but gradually pushes back towards bounds
+    # Column order: [W_mmi_um, L_mmi_um, gap_um, W_io_um, taper_len_um]
+    
+    bounds = np.array([
+        [3.0, 12.0],      # W_mmi
+        [30.0, 300.0],    # L_mmi
+        [0.15, 1.50],     # gap
+        [0.35, 0.55],     # W_io
+        [5.0, 40.0]       # taper
+    ])
+    
+    for col_idx in range(5):
+        lo, hi = bounds[col_idx]
+        mid = (lo + hi) / 2.0
+        scale = (hi - lo) / 2.0
+        # Soft clip: normalize to [-1, 1], tanh, then scale back
+        norm = (geom_samp[:, col_idx] - mid) / scale
+        clipped = mid + scale * np.tanh(norm)
+        geom_samp[:, col_idx] = clipped
+
     rows = []
     for i in range(n_samples):
         Wm, Lm, gap, Wio, taper = geom_samp[i]
