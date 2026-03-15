@@ -18,6 +18,11 @@ MMI-MZI-INVERSE-DESIGN/
 │   │   └── photonics-pipeline.agent.md  [NEW]
 │   └── workflows/
 │
+├── legacy/                               [NEW] - Deprecated code (preserved)
+│   ├── mmi_mzi_project.py               [MOVED from src/]
+│   ├── cgan_inverse.py                  [REFERENCE]
+│   └── README.md                        [Explains why deprecated]
+│
 ├── src/
 │   ├── physics_engine.py                [NEW] - Core S-param computation
 │   ├── dataset_manager.py               [NEW] - Clean pool, rejected pool,QC
@@ -86,15 +91,16 @@ MMI-MZI-INVERSE-DESIGN/
 ├── README.md                            [UPDATE] - Point to docs/
 └── .gitignore                           [UPDATE] - Exclude large data files
 
-DEPRECATED / TO DELETE:
-  - runs/pilot_v1/                       (mark as deprecated in docs)
-  - runs/pilot_v2/                       (rename to v2_baseline/)
-  - src/mmi_mzi_project.py               (refactor into src/*.py modules)
+DEPRECATED / TO MOVE (NOT DELETE):
+  - src/mmi_mzi_project.py               (move to legacy/mmi_mzi_project.py, mark deprecated)
   - src/cgan_inverse.py                  (merge into src/inverse_models.py)
   - src/train_v2_inverse_models.py       (merge into pipeline.py)
+  - runs/pilot_v1/                       (mark as deprecated in docs)
+  - runs/pilot_v2/                       (rename to v2_baseline/)
   - Various standalone scripts            (consolidate into pipeline.py)
 
-NOTE: Nothing deleted, only moved/deprecated. See migration plan in Stage 1.
+NOTE: Nothing deleted. Old files preserved in legacy/ or suffixed _deprecated.
+      All data in runs/ preserved; only reorganized.
 
 ================================================================================
 2. FILES TO CREATE / MODIFY / MERGE / DEPRECATE
@@ -106,20 +112,21 @@ STAGE 1: REPO STRUCTURE CLEANUP
     ✓ src/dataset_manager.py             (new clean/rejected pool manager)
     ✓ src/batch_generator.py             (extract + improve sampling)
     ✓ src/qc_protocol.py                 (new comprehensive QC)
-    ✓ src/pipeline.py                    (orchestrator, replaces/merges)
+    ✓ src/pipeline.py                    (orchestrator)
     ✓ tests/conftest.py                  (pytest fixtures)
+    ✓ legacy/README.md                   (explains deprecation)
     ✓ .github/agents/photonics-pipeline.agent.md
+  
+  Migrate (don't delete):
+    - src/mmi_mzi_project.py → legacy/mmi_mzi_project.py (reference copy)
   
   Modify:
     - README.md                          (link to docs/, mention stages)
     - Makefile                           (add test/lint targets)
     - environment.yml                    (add pytest, pytest-cov)
   
-  Merge/Delete:
-    - src/mmi_mzi_project.py → src/pipeline.py
-    - src/cgan_inverse.py → src/inverse_models.py
-    - src/train_v2_inverse_models.py → src/pipeline.py
-    - Mark runs/pilot_v1/, runs/pilot_v2/ as DEPRECATED (add README.md)
+  Preserve:
+    - runs/pilot_v1/, runs/pilot_v2/     (mark DEPRECATED, keep data)
 
 STAGE 2: DATASET ARCHITECTURE
   Create:
@@ -142,16 +149,31 @@ STAGE 2: DATASET ARCHITECTURE
     Rejected pool (JSONL, one per line):
       - geometry dict + reason_code + timestamp + run_id
 
-STAGE 3: GENERATION ENGINE
+STAGE 3: GENERATION ENGINE (WITH PHYSICS SANITY CHECKS)
   Create:
     ✓ src/batch_generator.py             (deterministic, resumable)
-    ✓ src/physics_engine.py              (S-param computation)
+    ✓ src/physics_engine.py              (S-param computation + sanity checks)
     ✓ src/pipeline.py batch commands
+  
+  Physics validation checks (MANDATORY, not optional):
+    - Passivity: |Sij| ≤ 1.05 for all S-parameters
+    - Energy conservation: sum(|Sij|²) ≤ 1.05
+    - Symmetry sanity: S-matrix physical properties
+    - Metric bounds: ER ∈ [0,40] dB, IL ∈ [0,10] dB, BW ∈ [0,100] nm
+    - Forward-check accuracy (after model trained)
+  
+  Failed rows → rejected_pool.jsonl with reason codes:
+    - "passivity_violation": |Sij| > 1.05
+    - "energy_violation": energy_sum > 1.05
+    - "symmetry_fail": S-matrix physics invalid
+    - "metric_bounds": ER/IL/BW out of range
+    - "forward_check_fail": prediction>±tolerance after model validation
   
   Specify:
     - Batch 1 (seed):   6000 geometries, sampled from core bounds
-    - Batch 2+....:     2000 geometries each, adaptive logic
-    - Resumable from manifests
+                        (OR: 2000 if dataset smaller than intended)
+    - Start fresh: Regenerate all 2000 from LHS, run physics on all
+    - Resumable from manifests via run_id tracking
 
 STAGE 4: QC SYSTEM
   Create:
@@ -341,14 +363,24 @@ Stage 2: Dataset Architecture (CRITICAL PATH)
   Deliverable: data/clean_pool.parquet + data/rejected_pool.jsonl schemas
   Blocking: Physics compute (next step)
 
-Stage 3: Complete v2 Physics Simulation (CRITICAL PATH)
-  Status: 15% DONE (need to compute 1700 new geometries)
+Stage 3: Complete Physics Simulation (Fresh Start)
+  Status: NOT STARTED (restart from scratch, discard v2 partial metrics)
   Duration: 4-8 hours (on single machine, parallelizable)
-  Scope: Run physics engine on 1700 LHS geometries
-  Deliverable: 1700 × 31 wavelengths ≈ 50K+ metric records
-  Input: runs/pilot_v2/data/selected_geometries.csv (2000 rows)
-  Output: device_long/ + mzi_metrics/ (all 2000 geometries)
-  Blocking: Inverse model retraining (next step after this)
+  Scope: Generate S-parameters + physics checks on all 2000 geometries
+  Deliverable: 2000 × 31 wavelengths ≈ 62K metric records + geometry-wise validation
+  
+  Physics checks mandatory on ALL outputs:
+    ✓ Passivity: |Sij| ≤ 1.05
+    ✓ Energy: sum(|Sij|²) ≤ 1.05  
+    ✓ Symmetry: Physical S-matrix properties
+    ✓ Metric bounds: ER [0,40], IL [0,10], BW [0,100]
+    ✓ Storage: Clean pool (pass all) + rejected pool (fail reason codes)
+  
+  Input: runs/pilot_v2/data/selected_geometries.csv (2000 geometries)
+  Output: 
+    - data/clean_pool.parquet (rows passing all QC)
+    - data/rejected_pool.jsonl (rows failing, with reason_code)
+    - data/manifests/batch_seed_run.json (provenance)
 
 Stage 4: QC System Implementation (CRITICAL PATH)
   Status: NOT STARTED
