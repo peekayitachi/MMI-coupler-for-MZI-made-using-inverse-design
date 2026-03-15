@@ -1,0 +1,580 @@
+================================================================================
+IMPLEMENTATION PLAN: MMI-MZI INVERSE DESIGN - NEXT STAGES
+================================================================================
+Date: March 15, 2026
+Scope: Stages 1-5 (completing the pipeline from current state to valid models)
+Based on: copilot-instructions.md + current V1/V2 progress report
+================================================================================
+
+1. PROPOSED FINAL REPO STRUCTURE
+================================================================================
+
+TARGET STRUCTURE (After all 9 stages complete):
+
+MMI-MZI-INVERSE-DESIGN/
+├── .github/
+│   ├── copilot-instructions.md          [EXISTING, READ-ONLY]
+│   ├── agents/
+│   │   └── photonics-pipeline.agent.md  [NEW]
+│   └── workflows/
+│
+├── src/
+│   ├── physics_engine.py                [NEW] - Core S-param computation
+│   ├── dataset_manager.py               [NEW] - Clean pool, rejected pool,QC
+│   ├── batch_generator.py               [NEW] - Sampling + adaptive logic
+│   ├── qc_protocol.py                   [NEW] - Hard/coverage/learnability checks
+│   ├── forward_model.py                 [NEW] - Training + evaluation (refactored)
+│   ├── inverse_models.py                [NEW] - MDN + cGAN unified interface
+│   ├── evaluation_suite.py              [NEW] - Full model evaluation protocol
+│   ├── export_manager.py                [NEW] - Git + Hugging Face packaging
+│   └── pipeline.py                      [NEW] - Main orchestrator (replaces mmi_mzi_project.py)
+│
+├── data/                                 [NEW] - Cumulative clean pool
+│   ├── clean_pool.parquet               [NEW] - Append-only accepted rows
+│   ├── rejected_pool.jsonl              [NEW] - Rejected rows + reason codes
+│   ├── manifests/
+│   │   ├── batch_001_seed_run.json      [NEW] - Provenance for seed run
+│   │   ├── batch_002_adaptive.json      [NEW] - Provenance for batch 2
+│   │   └── ...
+│   └── README.md                        [NEW] - Dataset protocol
+│
+├── runs/
+│   ├── pilot_v1/                        [EXISTING, DEPRECATED]
+│   ├── pilot_v2/                        [EXISTING, RENAMING → v2_baseline/]
+│   ├── v2_baseline/                     [MIGRATED]
+│   ├── batch_001_seed_run/              [NEW] - First 6000-row batch
+│   ├── batch_002_adaptive/              [NEW] - Adaptive sampling batch
+│   └── final_eval/                      [NEW] - Model evaluation runs
+│
+├── models/                              [NEW] - Versioned model checkpoints
+│   ├── forward/
+│   │   ├── v1_pilot/
+│   │   └── v2_final_3seeds/
+│   ├── inverse_mdn/
+│   │   ├── v1_pilot/
+│   │   └── v2_final_3seeds/
+│   └── inverse_cgan/
+│       ├── v1_pilot/
+│       └── v2_final_3seeds/
+│
+├── tests/                               [NEW] - Reproducibility + robustness tests
+│   ├── test_physics_engine.py           [NEW]
+│   ├── test_qc_protocol.py              [NEW]
+│   ├── test_dataset_manager.py          [NEW]
+│   ├── test_models.py                   [NEW]
+│   └── conftest.py                      [NEW] - Shared fixtures
+│
+├── docs/
+│   ├── PROJECT_OVERVIEW.md              [EXISTING]
+│   ├── VERSIONS_AND_CHANGES.md          [EXISTING]
+│   ├── SETUP_AND_DEPLOYMENT.md          [EXISTING]
+│   ├── V1_V2_PROGRESS_REPORT.txt        [EXISTING]
+│   ├── DATASET_PROTOCOL.md              [NEW] - Clean/rejected pool spec
+│   ├── QC_PROTOCOL.md                   [NEW] - Hard/coverage/learnability gates
+│   ├── MODEL_EVALUATION.md              [NEW] - Evaluation metrics + reporting
+│   └── LUMERICAL_VALIDATION.md          [NEW] - Spot-check manifest spec
+│
+├── notebooks/                           [NEW]
+│   ├── 01_Dataset_Exploration.ipynb     [NEW]
+│   ├── 02_QC_Diagnostics.ipynb          [NEW]
+│   └── 03_Model_Comparison.ipynb        [NEW]
+│
+├── AGENTS.md                            [EXISTING]
+├── environment.yml                      [UPDATE] - Add test dependencies
+├── requirements.txt                     [EXISTING]
+├── Makefile                             [UPDATE] - Add test/lint targets
+├── README.md                            [UPDATE] - Point to docs/
+└── .gitignore                           [UPDATE] - Exclude large data files
+
+DEPRECATED / TO DELETE:
+  - runs/pilot_v1/                       (mark as deprecated in docs)
+  - runs/pilot_v2/                       (rename to v2_baseline/)
+  - src/mmi_mzi_project.py               (refactor into src/*.py modules)
+  - src/cgan_inverse.py                  (merge into src/inverse_models.py)
+  - src/train_v2_inverse_models.py       (merge into pipeline.py)
+  - Various standalone scripts            (consolidate into pipeline.py)
+
+NOTE: Nothing deleted, only moved/deprecated. See migration plan in Stage 1.
+
+================================================================================
+2. FILES TO CREATE / MODIFY / MERGE / DEPRECATE
+================================================================================
+
+STAGE 1: REPO STRUCTURE CLEANUP
+  Create:
+    ✓ src/physics_engine.py              (extract from mmi_mzi_project.py)
+    ✓ src/dataset_manager.py             (new clean/rejected pool manager)
+    ✓ src/batch_generator.py             (extract + improve sampling)
+    ✓ src/qc_protocol.py                 (new comprehensive QC)
+    ✓ src/pipeline.py                    (orchestrator, replaces/merges)
+    ✓ tests/conftest.py                  (pytest fixtures)
+    ✓ .github/agents/photonics-pipeline.agent.md
+  
+  Modify:
+    - README.md                          (link to docs/, mention stages)
+    - Makefile                           (add test/lint targets)
+    - environment.yml                    (add pytest, pytest-cov)
+  
+  Merge/Delete:
+    - src/mmi_mzi_project.py → src/pipeline.py
+    - src/cgan_inverse.py → src/inverse_models.py
+    - src/train_v2_inverse_models.py → src/pipeline.py
+    - Mark runs/pilot_v1/, runs/pilot_v2/ as DEPRECATED (add README.md)
+
+STAGE 2: DATASET ARCHITECTURE
+  Create:
+    ✓ data/clean_pool.parquet            (empty initially, will be populated)
+    ✓ data/rejected_pool.jsonl           (empty, will accumulate failures)
+    ✓ data/manifests/                    (batch provenance)
+    ✓ data/README.md                     (dataset documentation)
+    ✓ src/dataset_manager.py             (if not in stage 1)
+    ✓ docs/DATASET_PROTOCOL.md           (specification)
+  
+  Build data schema:
+    Clean pool columns:
+      - geom_id, W_mmi, L_mmi, gap, W_io, taper_len
+      - wavelength_nm (per spectrum)
+      - s11_real, s11_imag, s12_real, s12_imag, s21_real, s21_imag, s22_real, s22_imag
+      - ER_dB, IL_dB, BW_nm
+      - run_id, batch_id, seed, sampler_type, engine_version, config_hash
+      - qc_flags (bounds_ok, passivity_ok, dup_check, etc.)
+    
+    Rejected pool (JSONL, one per line):
+      - geometry dict + reason_code + timestamp + run_id
+
+STAGE 3: GENERATION ENGINE
+  Create:
+    ✓ src/batch_generator.py             (deterministic, resumable)
+    ✓ src/physics_engine.py              (S-param computation)
+    ✓ src/pipeline.py batch commands
+  
+  Specify:
+    - Batch 1 (seed):   6000 geometries, sampled from core bounds
+    - Batch 2+....:     2000 geometries each, adaptive logic
+    - Resumable from manifests
+
+STAGE 4: QC SYSTEM
+  Create:
+    ✓ src/qc_protocol.py                 (hard/coverage/learnability gates)
+    ✓ docs/QC_PROTOCOL.md                (specification)
+    ✓ tests/test_qc_protocol.py
+  
+  Implement:
+    - Hard checks (bounds, NaN/Inf, duplicates, |S|, passivity, metric ranges)
+    - Coverage checks (binning, IQR, coarse pairwise, target-space grid)
+    - Split checks (KS, mean diff)
+    - Learnability gate (auxiliary metric predictor)
+
+STAGE 5: ADAPTIVE BATCH LOGIC
+  Create:
+    ✓ src/batch_generator.py adaptive logic
+    ✓ Uncertainty sampling from forward model
+    ✓ Geometry/metric region coverage analysis
+  
+  Implement:
+    - 50% under-covered regions (K-means or histogram binning)
+    - 30% forward uncertainty sampling (dropout-based)
+    - 20% local refinement (around promising geometries)
+
+(Stages 6-9 will be described but not implemented yet)
+
+================================================================================
+3. ASSUMPTIONS THAT MAY BE WRONG
+================================================================================
+
+ASSUMPTION 1: Physics Engine Reliability
+  Current belief: S-parameter computation via EMEPy/eigenmode solver is accurate
+  Risk: If solver has systematic bias (especially for IL), entire dataset will be biased
+  Mitigation: 
+    a) Include Lumerical spot-check early (Stage 8, before final training)
+    b) Implement physics validation metrics (passivity, energy conservation)
+    c) Log solver version + mesh parameters in every run
+  Action: Assume correct until Lumerical validation
+
+ASSUMPTION 2: Metric Diversity Sufficient at 2000 Geometries
+  Current belief: 2000 LHS geometries will give enough ER/IL/BW diversity
+  Risk: Device may have narrow feasible region → diversity still limited
+  Mitigation:
+    a) QC includes empirical IQR gates (≥ 8 dB ER, ≥ 0.8 dB IL, ≥ 20 nm BW)
+    b) If gates fail, expand sampling bounds or increase batch size
+    c) Implement per-metric histogram visualization
+  Action: Proceed with 2000; iterate if QC gates fail
+
+ASSUMPTION 3: Deterministic 70/15/15 Split OK for Cross-Validation
+  Current belief: Fixed split is reproducible and generalizable
+  Risk: May not match real deployment distribution
+  Mitigation:
+    a) Use stratified split on ER/IL/BW quartiles (avoid pathological splits)
+    b) Implement k-fold cross-validation option for robustness testing
+    c) Check KS statistic + mean difference before training
+  Action: Implement stratified split as default
+
+ASSUMPTION 4: MDN + cGAN Can Learn Multimodal Inverse Mapping
+  Current belief: Both models can map target specs → valid geometries
+  Risk: Inverse problem may be fundamentally ill-conditioned at target specs
+        (too many valid solutions or none exist)
+  Mitigation:
+    a) Auxiliary metric predictor as validity check (catches bad geometries)
+    b) Forward-check mandatory on all inverse outputs before reporting
+    c) Implement diversity penalty in loss (avoid mode collapse)
+  Action: Implement auxiliary predictor + forward-check gates
+
+ASSUMPTION 5: Lumerical Spot-Check Feasible
+  Current belief: Can access Lumerical for 100 validation runs
+  Risk: If no Lumerical access, cannot validate surrogate
+  Mitigation:
+    a) Mark all results as "Python engine only" until Lumerical runs
+    b) Implement synthetic Lumerical-like checks (passivity + energy balance)
+    c) Document clearly what is/isn't Lumerical-validated
+  Action: Assume available; prepare fallback in Stage 8
+
+================================================================================
+4. SCIENTIFIC RISKS VS SOFTWARE RISKS
+================================================================================
+
+SCIENTIFIC RISKS (Domain-specific, hard to mitigate):
+
+1. Physics Fidelity Risk (CRITICAL)
+   - EMEPy solver may have systematic IL bias (observed in progress report)
+   - Cannot be fixed in software alone; requires solver validation
+   - Mitigation: Lumerical spot-check (Stage 8)
+   - Impact: If solver biased, all downstream models biased
+   - Decision point: Must validate before claiming research-grade results
+
+2. Inverse Problem Ill-Conditioning (HIGH)
+   - Device may have no geometries achieving all target specs simultaneously
+   - Or opposite: all geometries achieve specs (trivial problem)
+   - Mitigation: QC gates ensure non-trivial metric diversity
+   - Impact: If targets unachievable → inverse model will fail
+   - Decision point: Check feasibility region coverage before final eval
+
+3. Surrogate Extrapolation Risk (MEDIUM)
+   - Forward model trained on simulated data, not fabricated devices
+   - May not generalize to real process variations
+   - Mitigation: Include fab tolerances (dW_nm, dGap_nm) in training
+   - Impact: Final inference on unknown until Lumerical validates
+   - Decision point: Mark results "simulated" vs "validated"
+
+4. Dataset Bias Risk (MEDIUM)
+   - LHS sampling may miss high-performance regions
+   - Random sampling in prior runs may have hidden structure
+   - Mitigation: Adaptive batch logic (coverage + uncertainty sampling)
+   - Impact: May need more than 12,000 rows to cover problem space
+   - Decision point: Check coverage metrics at each batch
+
+---
+
+SOFTWARE RISKS (Fixable in code):
+
+1. Resumability & Determinism Risk (CRITICAL)
+   - Must be able to stop/restart pipeline without data corruption
+   - Non-deterministic random seeds → non-reproducible results
+   - Mitigation: 
+     a) Manifest files track every batch (geometry IDs, seeds, config hash)
+     b) All RNG calls seeded from config (not time-based)
+     c) Append-only clean pool (never overwrite)
+     d) Unit tests for determinism (same seed → same output)
+   - Impact: If missed, impossible to debug or publish
+   - Decision point: Test resumability after Stage 2
+
+2. QC False Positives/Negatives (CRITICAL)
+   - If QC gates pass bad data → invalid models
+   - If QC gates too strict → insufficient data to train
+   - Mitigation:
+     a) Document every QC threshold + justification
+     b) Log rejected rows with detailed reason codes
+     c) Periodic manual audit of rejected samples
+     d) Run learnability gate before blocking batch
+   - Impact: Entire pipeline validity depends on QC correctness
+   - Decision point: Manual review of first 100 accepted/rejected rows
+
+3. Model Training Collapse Risk (MEDIUM)
+   - cGAN divergence (generator learning boundary solutions)
+   - MDN mode collapse (outputting single geometry)
+   - Mitigation:
+     a) Physics-informed loss terms
+     b) Diversity penalty (push model to explore parameter space)
+     c) Early stopping on validation set
+     d) Train 3 seeds, keep track of stability across seeds
+   - Impact: v2 already shows this failure; must fix before Stage 6
+   - Decision point: Retrain MDN/cGAN after dataset complete
+
+4. Data Leakage Risk (HIGH)
+   - Test/validation data used during hyperparameter tuning
+   - Forward model evaluated on its own training distribution
+   - Mitigation:
+     a) Deterministic train/val/test split before any model training
+     b) Hyperparameter tuning on validation set only
+     c) Final evaluation on fully held-out test set
+     d) Auxiliary metadata predictor trained separately
+   - Impact: If leaked, reported metrics are optimistic
+   - Decision point: Implement stratified split immediately (Stage 2)
+
+5. Version Control & Reproducibility Risk (MEDIUM)
+   - Code changes without tracking model versions
+   - Unclear which checkpoint trained on what data/config
+   - Mitigation:
+     a) Config hash stored with model checkpoint
+     b) Each batch gets unique run_id (timestamp + uuid)
+     c) Git commit after each stage with specific batch artifacts
+     d) Tag releases (v0.1_baseline, v1.0_12k_validated, etc.)
+   - Impact: Cannot reproduce published results if version unclear
+   - Decision point: Implement versioning in Stage 1
+
+================================================================================
+5. IMPLEMENTATION STAGES
+================================================================================
+
+PROPOSED STAGE BREAKDOWN (with current progress):
+
+Stage 1: Repo Structure Cleanup
+  Status: NOT STARTED
+  Duration: 1-2 days
+  Scope: Modularize src/, create pipeline.py, add tests infrastructure
+  Deliverable: Runnable pipeline.py with old behavior preserved
+  Blocking: Nothing (can be done in parallel with data work)
+
+Stage 2: Dataset Architecture (CRITICAL PATH)
+  Status: NOT STARTED
+  Duration: 2-3 days
+  Scope: Clean/rejected pools, manifests, provenance tracking
+  Deliverable: data/clean_pool.parquet + data/rejected_pool.jsonl schemas
+  Blocking: Physics compute (next step)
+
+Stage 3: Complete v2 Physics Simulation (CRITICAL PATH)
+  Status: 15% DONE (need to compute 1700 new geometries)
+  Duration: 4-8 hours (on single machine, parallelizable)
+  Scope: Run physics engine on 1700 LHS geometries
+  Deliverable: 1700 × 31 wavelengths ≈ 50K+ metric records
+  Input: runs/pilot_v2/data/selected_geometries.csv (2000 rows)
+  Output: device_long/ + mzi_metrics/ (all 2000 geometries)
+  Blocking: Inverse model retraining (next step after this)
+
+Stage 4: QC System Implementation (CRITICAL PATH)
+  Status: NOT STARTED
+  Duration: 2-3 days
+  Scope: Hard checks, coverage checks, learnability gate
+  Deliverable: src/qc_protocol.py + tests
+  Blocking: Batch generation (use QC in each batch)
+  Dependency: Needs cleaned dataset from Stage 3
+
+Stage 5: Adaptive Batch Logic
+  Status: NOT STARTED
+  Duration: 1-2 days
+  Scope: Uncertainty sampling, coverage refinement, geometric local search
+  Deliverable: src/batch_generator.py adaptive functions
+  Blocking: Running larger batches (use logic in production runs)
+  Dependency: Forward model uncertainty estimates
+
+Stage 6: Forward Model Training (Research-ready)
+  Status: PARTIAL (v2 trained on 300 geometries, needs retraining)
+  Duration: 2-3 days
+  Scope: Retrain on full 2000→12000 geometries, save scalers/residuals
+  Deliverable: forward_best.pt + full evaluation report
+  Output metrics: MAE, RMSE, R², NMAE on S-parameters + ER/IL/BW
+  Blocking: Inverse model training (needs forward for validation)
+  Dependency: Clean pool ≥ 2000 rows
+
+Stage 7: Inverse Models Training & Comparison (Research-ready)
+  Status: PARTIAL (v2 trained but collapsed, needs retraining + fix)
+  Duration: 3-4 days
+  Scope: Train MDN + cGAN on same dataset, 3 seeds each, fix collapse
+  Deliverable: inverse_mdn_best.pt + inverse_cgan_best.pt + training logs
+  Output: Reconstruction from v2 training (analyze why collapsed)
+  Blocking: Final evaluation (next stage)
+  Dependency: Forward model trained, clean pool stable
+
+Stage 8: Evaluation Suite (Research-ready)
+  Status: NOT STARTED
+  Duration: 2-3 days (+ Lumerical time if available)
+  Scope: 1000 held-out queries, 100 candidates/query, full metrics
+  Deliverable: evaluation_suite.py + comprehensive report
+  Output: SR@1/5/10, diversity, MAE, parity plots
+  Blocking: Model export (next stage)
+  Dependency: Both models trained, forward model reliable
+
+Stage 9: Export & Hugging Face Packaging
+  Status: PARTIAL (basic exports exist, need polish)
+  Duration: 1-2 days
+  Scope: FX-traced models, inference.py, example inputs/outputs, paper-ready docs
+  Deliverable: HF package + submission-ready model card
+  Testing: Download + inference from fresh environment
+  No blocking
+
+---
+
+CRITICAL PATH (fastest to valid models):
+  Stage 1 (1 day) → Stage 2 (1 day) → Stage 3 (8 hours) → Stage 4 (1 day)
+  → Stage 6 (1 day) → Stage 7 (2 days) → Stage 8 (2 days)
+  Total: ~8-9 days if sequential, 5-6 days if parallel where possible
+
+DEPENDENCIES:
+  - Stage 3 blocks Stage 6
+  - Stage 6 blocks Stage 7
+  - Stage 7 blocks Stage 8
+  - Can run Stages 1-2 in parallel with Stage 3
+
+================================================================================
+6. EXACT COMMANDS TO RUN (Stage 1: Repo Cleanup)
+================================================================================
+
+STAGE 1 SETUP & TESTING COMMANDS
+(To be run AFTER code creation; shown here for planning)
+
+# 1. Create test environment
+python -m pytest tests/ -v --cov=src --cov-report=term-missing
+
+# 2. Verify physics engine works
+python -c "from src.physics_engine import compute_s_parameters; print('Physics engine OK')"
+
+# 3. Verify dataset manager schema
+python -c "from src.dataset_manager import DatasetManager; dm = DatasetManager(); print('Dataset manager OK')"
+
+# 4. Test batch generator determinism
+python -c "
+from src.batch_generator import generate_batch
+seed=42
+b1 = generate_batch(n=100, seed=seed, mode='core')
+b2 = generate_batch(n=100, seed=seed, mode='core')
+assert (b1.values == b2.values).all(), 'Non-deterministic!'
+print('Batch generator deterministic')
+"
+
+# 5. Run pipeline help
+python src/pipeline.py --help
+
+# 6. Git commit Stage 1
+git add src/ tests/ .github/agents/ Makefile environment.yml
+git commit -m "Stage 1: Repo structure cleanup and modularization"
+git tag v0.1_modular
+
+====
+
+STAGE 3 PHYSICS COMPUTE COMMANDS
+(After Stage 1-2 complete; placeholder for planning)
+
+# Option A: Single-threaded (safe for first run)
+python src/pipeline.py compute-physics \
+    --input-geometries runs/pilot_v2/data/selected_geometries.csv \
+    --output-dir runs/batch_001_seed_run/data/ \
+    --n-geometries 2000 \
+    --wavelength-points 31 \
+    --verbose
+
+# Option B: Parallel (if available)
+python src/pipeline.py compute-physics \
+    --input-geometries runs/pilot_v2/data/selected_geometries.csv \
+    --output-dir runs/batch_001_seed_run/data/ \
+    --n-geometries 2000 \
+    --n-workers 8 \
+    --batch-size 250
+
+# Expected output:
+# runs/batch_001_seed_run/data/
+# ├── device_long/             (wavelength-resolved spectra)
+# ├── mzi_metrics/             (ER/IL/BW per geometry)
+# └── manifest.json            (provenance)
+
+====
+
+STAGE 4 QC COMMANDS
+(After physics complete)
+
+# Run QC on computed batch
+python src/pipeline.py validate-batch \
+    --batch-dir runs/batch_001_seed_run/ \
+    --output-report runs/batch_001_seed_run/qc_report.json \
+    --accept-threshold 0.85 \
+    --verbose
+
+# Expected output includes:
+# - Hard checks: 0% violations
+# - Coverage checks: ER IQR, IL IQR, BW IQR
+# - Learnability: Metric predictor MAE
+# - Recommendation: PASS / FAIL
+
+====
+
+STAGE 6 FORWARD MODEL COMMANDS
+(After QC passes)
+
+# Train forward model on clean pool
+python src/pipeline.py train-forward \
+    --clean-pool data/clean_pool.parquet \
+    --output-dir models/forward/v2_final_3seeds/ \
+    --epochs 80 \
+    --batch-size 512 \
+    --n-seeds 3 \
+    --val-fraction 0.15 \
+    --test-fraction 0.15
+
+# Expected output:
+# models/forward/v2_final_3seeds/
+# ├── seed_0/
+# │   ├── model_best.pt
+# │   ├── training.log
+# │   └── validation_metrics.json
+# ├── seed_1/
+# └── seed_2/
+# └── ensemble_report.json    (mean ± std across seeds)
+
+====
+
+STAGE 7 INVERSE MODEL COMMANDS
+(After forward model trained)
+
+# Train MDN + cGAN
+python src/pipeline.py train-inverse \
+    --clean-pool data/clean_pool.parquet \
+    --output-dir models/inverse_mdn/v2_final_3seeds \
+    --model-type mdn \
+    --n-seeds 3 \
+    --epochs 100
+
+python src/pipeline.py train-inverse \
+    --clean-pool data/clean_pool.parquet \
+    --output-dir models/inverse_cgan/v2_final_3seeds \
+    --model-type cgan \
+    --n-seeds 3 \
+    --epochs 300
+
+====
+
+STAGE 8 EVALUATION COMMANDS
+(After both models trained)
+
+# Run final evaluation
+python src/pipeline.py evaluate \
+    --clean-pool data/clean_pool.parquet \
+    --forward-dir models/forward/v2_final_3seeds/ \
+    --inverse-mdn-dir models/inverse_mdn/v2_final_3seeds/ \
+    --inverse-cgan-dir models/inverse_cgan/v2_final_3seeds/ \
+    --n-queries 1000 \
+    --n-candidates 100 \
+    --output-dir runs/final_eval/ \
+    --verbose
+
+# Outputs:
+# runs/final_eval/
+# ├── forward_eval_report.json         (MAE, RMSE, R², NMAE)
+# ├── inverse_mdn_eval_report.json     (SR@1/5/10, diversity, etc.)
+# ├── inverse_cgan_eval_report.json
+# ├── comparison_report.json           (MDN vs cGAN head-to-head)
+# ├── parity_plots.pdf
+# └── diversity_analysis.pdf
+
+================================================================================
+END OF PLAN
+================================================================================
+
+Next action: Confirm this plan OR request modifications before proceeding with
+           Stage 1 code implementation.
+
+Decision points:
+  1. Is this scope reasonable for "next phase"?
+  2. Are there missing dependencies or blocked tasks?
+  3. Should any stage be split/merged/reordered?
+  4. Are assumptions acceptable, or need more risk mitigation?
+
+Once approved → Begin Stage 1 implementation (repo structure).
+================================================================================
