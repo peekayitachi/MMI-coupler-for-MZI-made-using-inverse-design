@@ -363,24 +363,52 @@ Stage 2: Dataset Architecture (CRITICAL PATH)
   Deliverable: data/clean_pool.parquet + data/rejected_pool.jsonl schemas
   Blocking: Physics compute (next step)
 
-Stage 3: Complete Physics Simulation (Fresh Start)
+Stage 3: Iterative Batch Generation (Fresh Start, Incremental to 12k+)
   Status: NOT STARTED (restart from scratch, discard v2 partial metrics)
-  Duration: 4-8 hours (on single machine, parallelizable)
-  Scope: Generate S-parameters + physics checks on all 2000 geometries
-  Deliverable: 2000 × 31 wavelengths ≈ 62K metric records + geometry-wise validation
+  Duration: Varies (seed run 8-12h, then 4-6h per 2000-row batch)
+  Scope: Generate S-parameters + physics checks via ITERATIVE batches
   
-  Physics checks mandatory on ALL outputs:
-    ✓ Passivity: |Sij| ≤ 1.05
-    ✓ Energy: sum(|Sij|²) ≤ 1.05  
-    ✓ Symmetry: Physical S-matrix properties
-    ✓ Metric bounds: ER [0,40], IL [0,10], BW [0,100]
-    ✓ Storage: Clean pool (pass all) + rejected pool (fail reason codes)
+  BATCH SCHEDULE:
+    Batch 1 (seed): 6000 geometries (single large run for diversity foundation)
+                    Expected yield: ~4500-5500 clean rows (75-90%)
+    
+    Batch 2+:       2000 geometries each (repeated until clean_pool ≥ 12000)
+                    Expected per-batch yield: ~1500-1800 clean rows (75-90%)
+    
+    STOP CONDITION: clean_pool ≥ 12000 rows
+    PREFERRED END:  20000-25000 rows (higher diversity for better model training)
   
-  Input: runs/pilot_v2/data/selected_geometries.csv (2000 geometries)
-  Output: 
-    - data/clean_pool.parquet (rows passing all QC)
-    - data/rejected_pool.jsonl (rows failing, with reason_code)
-    - data/manifests/batch_seed_run.json (provenance)
+  Per-batch workflow:
+    1. Sample 2000 geometries (deterministic seed from manifest)
+    2. Compute S-parameters (31 wavelengths per geometry)
+    3. Physics checks mandatory:
+       ✓ Passivity: |Sij| ≤ 1.05
+       ✓ Energy: sum(|Sij|²) ≤ 1.05  
+       ✓ Symmetry: Physical S-matrix properties
+       ✓ Metric bounds: ER [0,40], IL [0,10], BW [0,100]
+    4. Append to appropriate pool:
+       → Clean pool: data/clean_pool.parquet (all checks pass)
+       → Rejected pool: data/rejected_pool.jsonl (reason_code documented)
+    5. Update batch manifest: data/manifests/batch_N.json
+    6. Log diagnostics: 
+       - Accept rate (%)
+       - Per-check failure modes
+       - Cumulative clean pool size
+       - Coverage statistics (geometry + metric distributions)
+  
+  Output structure:
+    data/
+    ├── clean_pool.parquet           (append-only, grows with each batch)
+    ├── rejected_pool.jsonl          (append-only, tracks all failures)
+    ├── manifests/
+    │   ├── batch_001_seed_6k.json   (6000 geometries, run_id, provenance)
+    │   ├── batch_002_adaptive.json  (2000 geometries)
+    │   ├── batch_003_adaptive.json  (2000 geometries)
+    │   └── ...
+    └── diagnostics/
+        ├── batch_001_qc_report.json
+        ├── batch_002_qc_report.json
+        └── cumulative_coverage.json  (updated after each batch)
 
 Stage 4: QC System Implementation (CRITICAL PATH)
   Status: NOT STARTED
@@ -390,40 +418,172 @@ Stage 4: QC System Implementation (CRITICAL PATH)
   Blocking: Batch generation (use QC in each batch)
   Dependency: Needs cleaned dataset from Stage 3
 
-Stage 5: Adaptive Batch Logic
+Stage 5: Adaptive Batch Logic (Ongoing, applied in batches 2+)
   Status: NOT STARTED
   Duration: 1-2 days
-  Scope: Uncertainty sampling, coverage refinement, geometric local search
+  Scope: Batch 2+ sampling strategies (after seed run complete, clean_pool ≥ 4500)
+  
+  Adaptive sampling composition (50/30/20 split per batch):
+    50% Under-covered regions:
+      - Identify geometry feature space bins (histogram per param)
+      - Find cells with <2% occupancy
+      - Preferentially sample from sparse regions (K-means clustering)
+    
+    30% Forward-model uncertainty:
+      - Use trained forward model to estimate prediction variance
+      - High epistemic uncertainty → likely understudied region
+      - Method: Dropout-based uncertainty (if available)
+    
+    20% Local refinement:
+      - Identify promising geometries (high ER, low IL, wide BW)
+      - Generate perturbations around top performers
+      - Refine boundaries between feasible/infeasible regions
+  
+  STOP CONDITION: clean_pool ≥ 12000 rows (preferred: 20-25k)
+  
   Deliverable: src/batch_generator.py adaptive functions
-  Blocking: Running larger batches (use logic in production runs)
-  Dependency: Forward model uncertainty estimates
+  Blocking: Running larger batches iteratively
+  Dependency: Forward model trained after seed run batch 1
 
-Stage 6: Forward Model Training (Research-ready)
-  Status: PARTIAL (v2 trained on 300 geometries, needs retraining)
-  Duration: 2-3 days
-  Scope: Retrain on full 2000→12000 geometries, save scalers/residuals
-  Deliverable: forward_best.pt + full evaluation report
-  Output metrics: MAE, RMSE, R², NMAE on S-parameters + ER/IL/BW
-  Blocking: Inverse model training (needs forward for validation)
-  Dependency: Clean pool ≥ 2000 rows
+Stage 6: Forward Model Training (Research-ready, Single-Seed + 3-Seed Infrastructure)
+  Status: NOT STARTED
+  Duration: 1-2 days (single seed), extensible to 3d for robustness study
+  Scope: Train on full clean pool (12000-25000 geometries)
+  Deliverable: forward_best.pt + evaluation report
+  
+  Code structure (single-seed now, 3-seed ready for future):
+    - Config parameter: n_seeds=1 (default) or n_seeds=3 (when robustness needed)
+    - Output directory: models/forward/v3_final_[1seed|3seeds]/
+    - Training loop: iterate over seeds, checkpoint best per seed
+  
+  Training details:
+    - Input: data/clean_pool.parquet (12000-25000 rows)
+    - Deterministic 70/15/15 split
+    - Standardized using saved scalers
+    - Loss: MSE + conservation penalty (|Σ|Sij|²-1|²)
+  
+  Output metrics (on test set):
+    - S-parameters: MAE, RMSE, R²
+    - Derived metrics: MAE(ER), MAE(IL), MAE(BW)
+    - Residual plots: per metric, per geometry
+    - Extrapolation check: test loss vs training loss
+  
+  Blocking: Inverse model training (uses forward for validation)
+  Dependency: Clean pool ≥ 12000 rows
 
-Stage 7: Inverse Models Training & Comparison (Research-ready)
-  Status: PARTIAL (v2 trained but collapsed, needs retraining + fix)
-  Duration: 3-4 days
-  Scope: Train MDN + cGAN on same dataset, 3 seeds each, fix collapse
-  Deliverable: inverse_mdn_best.pt + inverse_cgan_best.pt + training logs
-  Output: Reconstruction from v2 training (analyze why collapsed)
-  Blocking: Final evaluation (next stage)
+Stage 7: Inverse Models Training & Comparison (Research-ready, Single-Seed + 3-Seed Infrastructure)
+  Status: NOT STARTED
+  Duration: 1-2 days (single seed), extensible to 3d for robustness study
+  Scope: Train MDN + cGAN on same clean pool (12000-25000 rows)
+  
+  Code structure (single-seed now, 3-seed ready for future):
+    - Config parameter: n_seeds=1 (default) or n_seeds=3 (when robustness needed)
+    - Output directories:
+        models/inverse_mdn/v3_final_[1seed|3seeds]/
+        models/inverse_cgan/v3_final_[1seed|3seeds]/
+    - Training loop: iterate over seeds, checkpoint best per seed
+  
+  Training details per model:
+    MDN:
+      - Input: ER/IL/BW (standardized)
+      - Output: 5D geometry distribution (K=8 mixture components)
+      - Loss: Negative log-likelihood + diversity penalty
+      - Fix for collapse: Encourage mode exploration
+    
+    cGAN:
+      - Input: Target specs + noise
+      - Generator: noise + condition → geometry
+      - Discriminator: geometry + condition → real/fake
+      - Loss: Adversarial + geometry bounds penalty
+      - Fix for boundary collapse: Regularize generator toward center
+  
+  Both models:
+    - Same clean pool, same 70/15/15 split
+    - Same input normalization (use forward model scalers)
+    - Same output clipping rules (enforce bounds post-sampling)
+  
+  Deliverable: 
+    - MDN checkpoint + training log
+    - cGAN checkpoint + training log
+    - Side-by-side training comparison
+  
+  Blocking: Final evaluation
   Dependency: Forward model trained, clean pool stable
 
-Stage 8: Evaluation Suite (Research-ready)
+Stage 8: Comprehensive Evaluation Suite (Research-ready, Python validation only)
   Status: NOT STARTED
-  Duration: 2-3 days (+ Lumerical time if available)
-  Scope: 1000 held-out queries, 100 candidates/query, full metrics
-  Deliverable: evaluation_suite.py + comprehensive report
-  Output: SR@1/5/10, diversity, MAE, parity plots
-  Blocking: Model export (next stage)
+  Duration: 1-2 days
+  Scope: Full evaluation on held-out test set + 1000 target queries
+  
+  FORWARD MODEL EVALUATION:
+    Locked test set (15% of clean pool):
+      - S-parameters: MAE, RMSE, R²
+      - Derived metrics:
+        * ER: MAE, RMSE, mean signed error
+        * IL: MAE, RMSE, mean signed error
+        * BW: MAE, RMSE, mean signed error
+      - Parity plots: target vs predicted
+      - Residual analysis: per metric, per geometry feature
+      - Extrapolation risk: compare test vs training loss profile
+  
+  INVERSE MODEL EVALUATION (MDN and cGAN, same protocol):
+    Test queries: 1000 held-out target specs (ER/IL/BW combinations)
+    Candidates per query: 100
+    
+    Success rates:
+      - SR@1: exact match (±tolerance on all specs)
+      - SR@5: top 5 contains valid candidate
+      - SR@10: top 10 contains valid candidate
+      - Tolerance: ER ±1 dB, IL ±0.5 dB, BW ±5 nm
+    
+    Accuracy metrics:
+      - MAE(ER), MAE(IL), MAE(BW) after forward-check
+      - Median absolute error (MAE percentiles)
+      - Fraction of candidates passing forward-check
+    
+    Validity metrics:
+      - Pre-clip validity: % geometries within bounds before clipping
+      - Post-clip validity: % geometries valid after bounds clipping
+      - Physics sanity: % meeting passivity/energy/symmetry checks
+    
+    Diversity metrics:
+      - Unique candidate ratio: (distinct geoms) / (total samples)
+      - Mean pairwise geometry distance: average Euclidean distance
+      - Parameter-wise std: spread in W_mmi, L_mmi, gap, W_io, taper_len
+      - Target-conditioned coverage: # unique achievable (ER, IL, BW) triplets
+    
+    Per-spec parity plots:
+      - ER: target vs achieved (scatter + marginal histograms)
+      - IL: target vs achieved
+      - BW: target vs achieved
+    
+    Per-model diagnostics:
+      - MDN: mixture component statistics, calibration of predicted std
+      - cGAN: mode coverage (how many modes explored), generator stability
+  
+  CROSS-MODEL COMPARISON:
+    MDN vs cGAN head-to-head on same 1000 queries:
+      - Which achieves higher SR@1, SR@5, SR@10?
+      - Which is more diverse (pairwise distance, parameter std)?
+      - Which is more stable across targets?
+      - Trade-off analysis: accuracy vs diversity
+    
+    Summary report:
+      - Table: Metrics for both models
+      - Recommendation: "MDN better for [X], cGAN better for [Y]"
+      - Failure case analysis
+  
+  Output deliverables:
+    - forward_eval_report.json (comprehensive metrics table)
+    - inverse_mdn_eval_report.json
+    - inverse_cgan_eval_report.json
+    - comparison_report.json (MDN vs cGAN)
+    - parity_plots.pdf (ER, IL, BW target vs achieved)
+    - diversity_analysis.pdf (candidate spread, mode coverage)
+    - failure_analysis.txt (documented failure modes per model)
+  
   Dependency: Both models trained, forward model reliable
+  Blocking: Final export (Stage 9)
 
 Stage 9: Export & Hugging Face Packaging
   Status: PARTIAL (basic exports exist, need polish)
@@ -435,16 +595,49 @@ Stage 9: Export & Hugging Face Packaging
 
 ---
 
-CRITICAL PATH (fastest to valid models):
-  Stage 1 (1 day) → Stage 2 (1 day) → Stage 3 (8 hours) → Stage 4 (1 day)
-  → Stage 6 (1 day) → Stage 7 (2 days) → Stage 8 (2 days)
-  Total: ~8-9 days if sequential, 5-6 days if parallel where possible
+CRITICAL PATH (fastest to valid models with full iterative dataset):
+  
+  Stage 1 (1 day):    Cleanup + modularization
+  
+  Stage 3 Batch 1 (1.5d):   Seed run (6000 geometries)
+                            → Physics compute + QC
+                            → Expected yield: ~4500-5500 clean rows
+  
+  Stage 6 (1d):             Forward model training on batch 1 results
+  
+  Stages 3 Batches 2+ (2-3d): Iterative adaptive batches (2000 each)
+                              → Physics compute + QC per batch
+                              → Repeat until clean_pool ≥ 12000
+                              → Expected: 3-4 additional batches
+  
+  Stage 4 (parallel):       QC gates + coverage monitoring (ongoing in each batch)
+  Stage 5 (embedded):       Adaptive sampling logic in batch 2+ generation
+  
+  Stage 7 (1d):             Inverse models (MDN + cGAN, single-seed)
+  
+  Stage 8 (1d):             Comprehensive evaluation
+                            (1000 queries × 100 candidates, full metrics)
+  
+  TOTAL: ~8-10 days (batching adds time for higher quality)
+  
+  OPTIONAL EXTENSION to 20-25k clean rows: +2-3 days additional batching
+  (recommended for greater diversity and model robustness)
 
+BATCH TIMELINE EXAMPLE (to reach 20k):
+  Batch 1: 6000 raw → ~5000 clean (5000 total)
+  Batch 2: 2000 raw → ~1700 clean (6700 total)
+  Batch 3: 2000 raw → ~1700 clean (8400 total)
+  Batch 4: 2000 raw → ~1700 clean (10100 total)
+  Batch 5: 2000 raw → ~1700 clean (11800 total) ← stops at 12k minimum
+  Batch 6: 2000 raw → ~1700 clean (13500 total) ← optional
+  ...continue to ~20k
+  
 DEPENDENCIES:
-  - Stage 3 blocks Stage 6
-  - Stage 6 blocks Stage 7
-  - Stage 7 blocks Stage 8
-  - Can run Stages 1-2 in parallel with Stage 3
+  - Stage 3 (batches) occur sequentially or with overlap
+  - Stage 6 can start after Batch 1 completes
+  - Stages 4-5 run continuously (adaptive logic refines each batch)
+  - Stage 7 waits for clean_pool ≥ 12000
+  - Stage 8 runs after Stages 6-7 complete
 
 ================================================================================
 6. EXACT COMMANDS TO RUN (Stage 1: Repo Cleanup)
